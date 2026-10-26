@@ -1,0 +1,177 @@
+#Requires -Version 5.1
+<#
+    install.ps1 - Windows bootstrap for claude-carbon.
+
+    Usage (PowerShell):
+      irm https://raw.githubusercontent.com/gwittebolle/claude-carbon/main/install.ps1 | iex
+
+    claude-carbon itself is bash, and stays bash on Windows: Claude Code spawns the
+    bash.exe from Git for Windows to run hooks and the status line, so the plugin
+    has to speak the same shell its host does. This script only does the part
+    PowerShell is needed for - finding that bash.exe, installing with winget the two
+    commands Git for Windows does not ship when they are missing - and then hands
+    over to install.sh.
+#>
+
+$ErrorActionPreference = 'Stop'
+
+$InstallUrl = if ($env:CLAUDE_CARBON_INSTALL_URL) {
+    $env:CLAUDE_CARBON_INSTALL_URL
+} else {
+    'https://raw.githubusercontent.com/gwittebolle/claude-carbon/main/install.sh'
+}
+
+Write-Host ''
+Write-Host '  claude-carbon installer'
+Write-Host '  Track the carbon footprint of your Claude Code sessions.'
+Write-Host ''
+
+# ── 1. Locate Git Bash ───────────────────────────────────────────────────────
+function Find-GitBash {
+    $candidates = @(
+        # The same variable Claude Code reads, so a non-default Git install only
+        # has to be declared once.
+        $env:CLAUDE_CODE_GIT_BASH_PATH,
+        (Join-Path $env:ProgramFiles 'Git\bin\bash.exe'),
+        (Join-Path ${env:ProgramFiles(x86)} 'Git\bin\bash.exe'),
+        (Join-Path $env:LOCALAPPDATA 'Programs\Git\bin\bash.exe')
+    ) | Where-Object { $_ }
+
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+    }
+
+    # PATH as a last resort. C:\Windows\System32\bash.exe is skipped deliberately:
+    # that one launches WSL, and installing through it would put claude-carbon
+    # inside the Linux distribution rather than on Windows.
+    Get-Command bash.exe -All -ErrorAction SilentlyContinue |
+        Where-Object { $_.Source -and $_.Source -notmatch '\\System32\\' } |
+        Select-Object -First 1 -ExpandProperty Source
+}
+
+$bash = Find-GitBash
+if (-not $bash) {
+    Write-Host 'ERROR: Git for Windows was not found.' -ForegroundColor Red
+    Write-Host '  claude-carbon runs on its bash, and so does Claude Code''s own Bash tool.'
+    Write-Host ''
+    Write-Host '  Install it:  winget install Git.Git'
+    Write-Host '  Already installed elsewhere? Point at it and rerun:'
+    Write-Host '    $env:CLAUDE_CODE_GIT_BASH_PATH = "D:\Git\bin\bash.exe"'
+    exit 1
+}
+Write-Host "  Git Bash: $bash"
+
+# ── 2. Check the two commands Git for Windows does not ship ──────────────────
+# jq and sqlite3 are the whole Windows prerequisite list: bash, awk, sed, grep,
+# date, curl and git all come with Git for Windows.
+
+# winget records its install directory in the registry PATH, but a terminal opened
+# before that keeps the old value, and the bash spawned below inherits it. Merge
+# the registry PATH in first, so `winget install` followed by a rerun in the same
+# terminal finds the new commands. Entries already present are left alone.
+function Merge-RegistryPath {
+    $current = @($env:Path -split ';' | Where-Object { $_ })
+    $registry = @('Machine', 'User') |
+        ForEach-Object { [Environment]::GetEnvironmentVariable('Path', $_) } |
+        Where-Object { $_ } |
+        ForEach-Object { $_ -split ';' } |
+        Where-Object { $_ }
+    $absent = @($registry | Where-Object { $current -notcontains $_ })
+    if ($absent.Count -gt 0) {
+        $env:Path = ($current + $absent) -join ';'
+    }
+}
+Merge-RegistryPath
+
+$deps = @(
+    @{ Name = 'jq';      Package = 'jqlang.jq' },
+    @{ Name = 'sqlite3'; Package = 'SQLite.SQLite' }
+)
+
+function Find-Missing {
+    $absent = @()
+    foreach ($dep in $deps) {
+        # Resolved through Git Bash, not PowerShell: that is the PATH the plugin will
+        # actually run under, and it includes the Git usr\bin directory.
+        & $bash -lc "command -v $($dep.Name)" *> $null
+        if ($LASTEXITCODE -ne 0) { $absent += $dep }
+    }
+    return ,$absent
+}
+
+$missing = Find-Missing
+
+# Both are winget "portable" packages: unpacked under the user's profile, no
+# administrator prompt, so the installer fetches them itself, as install.sh does
+# for jq on a Mac. `--source winget`: see the error message below.
+# Its exit code is kept for the message below; whether the command is now found is
+# what decides, since winget also exits non-zero for a package already installed.
+$wingetExit = @{}
+if ($missing.Count -gt 0 -and (Get-Command winget.exe -ErrorAction SilentlyContinue)) {
+    foreach ($dep in $missing) {
+        Write-Host "  $($dep.Name): installing $($dep.Package) with winget..."
+        # Windows PowerShell 5.1 turns each stderr line of a redirected native command
+        # into an error, which 'Stop' would make fatal before the fallback message.
+        $ErrorActionPreference = 'Continue'
+        try {
+            winget install --id $dep.Package --exact --source winget `
+                --accept-package-agreements --accept-source-agreements --disable-interactivity *> $null
+            $wingetExit[$dep.Name] = $LASTEXITCODE
+        } catch {
+            $wingetExit[$dep.Name] = 'error'
+        } finally {
+            $ErrorActionPreference = 'Stop'
+        }
+    }
+    Merge-RegistryPath
+    $missing = Find-Missing
+}
+
+$missingNames = @($missing | ForEach-Object { $_.Name })
+foreach ($dep in $deps) {
+    if ($missingNames -notcontains $dep.Name) { Write-Host "  $($dep.Name): OK" }
+}
+
+if ($missing.Count -gt 0) {
+    Write-Host ''
+    Write-Host 'ERROR: missing dependencies.' -ForegroundColor Red
+    # `--source winget`: without it winget also queries the Microsoft Store source,
+    # and when that one is unreachable (a TLS-inspecting proxy, a locked-down
+    # Store) it aborts the whole install with exit code 94 instead of falling back.
+    foreach ($dep in $missing) {
+        if ($wingetExit.ContainsKey($dep.Name)) {
+            Write-Host "  $($dep.Name) - winget could not install it (exit $($wingetExit[$dep.Name]))."
+        }
+        Write-Host "  $($dep.Name) - install with:  winget install $($dep.Package) --source winget"
+    }
+    Write-Host ''
+    Write-Host '  Then rerun this installer. The same terminal is fine: PATH is re-read.'
+    exit 1
+}
+
+# ── 3. Hand over to install.sh ───────────────────────────────────────────────
+Write-Host ''
+Write-Host 'Running the installer...'
+
+$tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("claude-carbon-" + [System.Guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
+$scriptPath = Join-Path $tempDir 'install.sh'
+
+try {
+    Invoke-WebRequest -Uri $InstallUrl -OutFile $scriptPath -UseBasicParsing
+} catch {
+    Write-Host "ERROR: could not download the installer from $InstallUrl" -ForegroundColor Red
+    Write-Host "  $($_.Exception.Message)"
+    exit 1
+}
+
+# The download arrives with whatever line endings the server sent. bash treats a
+# trailing carriage return as part of every command, so normalise before running.
+$content = [System.IO.File]::ReadAllText($scriptPath)
+[System.IO.File]::WriteAllText($scriptPath, $content.Replace("`r`n", "`n"))
+
+& $bash $scriptPath
+$code = $LASTEXITCODE
+
+Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+exit $code
