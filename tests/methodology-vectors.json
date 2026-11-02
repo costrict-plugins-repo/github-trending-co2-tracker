@@ -1,0 +1,240 @@
+{
+  "_purpose": "Canonical golden vectors for the claude-carbon methodology. Source of truth shared with downstream consumers (TokenClimate SaaS keeps a byte-identical copy in tests/fixtures/ and checks it weekly). Any change to data/factors.json or data/prices.json MUST update these expected values in the same commit.",
+  "_formulas": {
+    "co2_grams": "((input_tokens + cache_creation_tokens) * factor_in + cache_read_tokens * (factor_in * cache_read_factor) + output_tokens * factor_out) / 1e6",
+    "cost_usd": "(input_tokens * price_in + cw_1h * (price_in * cache_write_multiplier_1h) + cw_5m * (price_in * cache_write_multiplier) + cache_read_tokens * (price_in * cache_read_multiplier) + output_tokens * price_out) / 1e6",
+    "_cache_write_ttl_split": "cw_1h = min(cache_creation_1h_tokens, cache_creation_tokens); cw_5m = cache_creation_tokens - cw_1h. cache_creation_1h_tokens is OPTIONAL and defaults to 0, which prices the whole cache write at the 5-minute tier and reproduces the pre-split formula exactly. Every vector without the field is therefore unchanged by the split."
+  },
+  "_token_semantics": "input_tokens here is the UNCACHED input (Anthropic usage.input_tokens). cache_creation_tokens (cache write) is separate, and cache_creation_1h_tokens is the subset of it written at the 1-hour TTL (Anthropic usage.cache_creation.ephemeral_1h_input_tokens); the 5-minute portion is the remainder. Note: the plugin DB column input_tokens stores input + cache_write; these vectors keep them split, as captured from the JSONL.",
+  "_constants": {
+    "cache_read_factor": 0.08,
+    "cache_write_multiplier": 1.25,
+    "cache_write_multiplier_1h": 2.0,
+    "cache_read_multiplier": 0.1,
+    "factors_gco2e_per_mtok": {
+      "fable": {
+        "input": 156,
+        "output": 3304
+      },
+      "opus": {
+        "input": 78,
+        "output": 1652
+      },
+      "sonnet": {
+        "input": 39,
+        "output": 826
+      },
+      "haiku": {
+        "input": 10,
+        "output": 207
+      }
+    },
+    "prices_usd_per_mtok": {
+      "fable": {
+        "input": 10,
+        "output": 50
+      },
+      "opus": {
+        "input": 4,
+        "output": 20
+      },
+      "sonnet": {
+        "input": 2,
+        "output": 10
+      },
+      "haiku": {
+        "input": 0.1,
+        "output": 0.5
+      }
+    }
+  },
+  "_rounding": "All token counts are multiples of 10,000 so every expected value is EXACT at <= 3 decimals for co2_grams and <= 4 decimals for cost_usd. This makes the vectors implementation-agnostic: the bash plugin prints co2 at 4 decimals / cost at 6 decimals, the SaaS rounds co2 to 3 decimals / cost to 4 decimals, and both land on the exact value. Runners compare with a relative tolerance of 1e-6.",
+  "_excluded_semantics": "Vectors with excluded=true use a model string without 'claude' (or matching factors.json exclude_models). expected_* is null: the bash plugin stores co2_grams=0 / cost_usd=0 with excluded=1 (raw tokens kept, no estimate); the SaaS returns null ('CO2 non connu'). Both mean: no number is fabricated.",
+  "vectors": [
+    {
+      "id": "fable-mixed",
+      "description": "Fable 5, full mix of all four token kinds",
+      "model": "claude-fable-5",
+      "input_tokens": 50000,
+      "cache_creation_tokens": 200000,
+      "cache_read_tokens": 3000000,
+      "output_tokens": 30000,
+      "expected_co2_grams": 175.56,
+      "expected_cost_usd": 7.5
+    },
+    {
+      "id": "opus-no-cache",
+      "description": "Opus, plain input/output, no cache traffic",
+      "model": "claude-opus-4-6",
+      "input_tokens": 1000000,
+      "cache_creation_tokens": 0,
+      "cache_read_tokens": 0,
+      "output_tokens": 100000,
+      "expected_co2_grams": 243.2,
+      "expected_cost_usd": 6.0
+    },
+    {
+      "id": "sonnet-cache-read-dominant",
+      "description": "Sonnet, cache_read dominant - shape of a real Claude Code session (dated model id resolved by family pattern)",
+      "model": "claude-sonnet-4-5-20250929",
+      "input_tokens": 20000,
+      "cache_creation_tokens": 150000,
+      "cache_read_tokens": 12000000,
+      "output_tokens": 80000,
+      "expected_co2_grams": 110.15,
+      "expected_cost_usd": 3.615
+    },
+    {
+      "id": "haiku-mixed",
+      "description": "Haiku, full mix of all four token kinds",
+      "model": "claude-3-5-haiku",
+      "input_tokens": 40000,
+      "cache_creation_tokens": 10000,
+      "cache_read_tokens": 500000,
+      "output_tokens": 20000,
+      "expected_co2_grams": 5.04,
+      "expected_cost_usd": 0.02025
+    },
+    {
+      "id": "opus-cache-write-only",
+      "description": "Opus, cache_write only: full input factor for CO2, 1.25x input price",
+      "model": "claude-opus-4-6",
+      "input_tokens": 0,
+      "cache_creation_tokens": 100000,
+      "cache_read_tokens": 0,
+      "output_tokens": 0,
+      "expected_co2_grams": 7.8,
+      "expected_cost_usd": 0.5
+    },
+    {
+      "id": "sonnet-cache-read-only",
+      "description": "Sonnet, cache_read only: 0.08x input factor for CO2, 0.1x input price",
+      "model": "claude-sonnet-4",
+      "input_tokens": 0,
+      "cache_creation_tokens": 0,
+      "cache_read_tokens": 1000000,
+      "output_tokens": 0,
+      "expected_co2_grams": 3.12,
+      "expected_cost_usd": 0.2
+    },
+    {
+      "id": "all-zeros",
+      "description": "Known model, zero tokens everywhere",
+      "model": "claude-sonnet-4",
+      "input_tokens": 0,
+      "cache_creation_tokens": 0,
+      "cache_read_tokens": 0,
+      "output_tokens": 0,
+      "expected_co2_grams": 0.0,
+      "expected_cost_usd": 0.0
+    },
+    {
+      "id": "excluded-non-claude-model",
+      "description": "Non-Anthropic model (e.g. local model behind ANTHROPIC_BASE_URL): no estimate is fabricated",
+      "model": "glm-4.7-flash",
+      "input_tokens": 100000,
+      "cache_creation_tokens": 50000,
+      "cache_read_tokens": 2000000,
+      "output_tokens": 40000,
+      "excluded": true,
+      "expected_co2_grams": null,
+      "expected_cost_usd": null
+    },
+    {
+      "id": "fable-mythos-alias",
+      "description": "Fable family via the mythos model id",
+      "model": "claude-mythos-5",
+      "input_tokens": 10000,
+      "cache_creation_tokens": 0,
+      "cache_read_tokens": 0,
+      "output_tokens": 10000,
+      "expected_co2_grams": 34.6,
+      "expected_cost_usd": 0.6
+    },
+    {
+      "id": "opus-heavy-session",
+      "description": "Opus, large session with heavy cache traffic",
+      "model": "claude-opus-4-7",
+      "input_tokens": 30000,
+      "cache_creation_tokens": 400000,
+      "cache_read_tokens": 8000000,
+      "output_tokens": 60000,
+      "expected_co2_grams": 182.58,
+      "expected_cost_usd": 6.52
+    },
+    {
+      "id": "haiku-tiny-session",
+      "description": "Haiku, small symmetric session, no cache",
+      "model": "claude-haiku",
+      "input_tokens": 10000,
+      "cache_creation_tokens": 0,
+      "cache_read_tokens": 0,
+      "output_tokens": 10000,
+      "expected_co2_grams": 2.17,
+      "expected_cost_usd": 0.006
+    },
+    {
+      "id": "opus-cache-write-1h-only",
+      "description": "Opus, cache_write only at the 1-hour TTL: same CO2 as the 5-minute twin (a write is a full prefill either way), 2x input price instead of 1.25x",
+      "model": "claude-opus-4-6",
+      "input_tokens": 0,
+      "cache_creation_tokens": 100000,
+      "cache_creation_1h_tokens": 100000,
+      "cache_read_tokens": 0,
+      "output_tokens": 0,
+      "expected_co2_grams": 7.8,
+      "expected_cost_usd": 0.8
+    },
+    {
+      "id": "opus-cache-write-split-ttl",
+      "description": "Opus, one session mixing both cache-write tiers (150k at 1h, 50k at 5m)",
+      "model": "claude-opus-4-6",
+      "input_tokens": 0,
+      "cache_creation_tokens": 200000,
+      "cache_creation_1h_tokens": 150000,
+      "cache_read_tokens": 0,
+      "output_tokens": 0,
+      "expected_co2_grams": 15.6,
+      "expected_cost_usd": 1.45
+    },
+    {
+      "id": "opus-claude-code-session-1h",
+      "description": "Opus, real Claude Code shape with every cache write at the 1-hour TTL (what the client actually does)",
+      "model": "claude-opus-4-7",
+      "input_tokens": 20000,
+      "cache_creation_tokens": 400000,
+      "cache_creation_1h_tokens": 400000,
+      "cache_read_tokens": 8000000,
+      "output_tokens": 60000,
+      "expected_co2_grams": 181.8,
+      "expected_cost_usd": 7.68
+    },
+    {
+      "id": "sonnet-cache-write-1h-over-total",
+      "description": "Sonnet, malformed input where the 1-hour subset exceeds the total cache write: clamped to the total, never a negative 5-minute remainder",
+      "model": "claude-sonnet-4",
+      "input_tokens": 0,
+      "cache_creation_tokens": 100000,
+      "cache_creation_1h_tokens": 500000,
+      "cache_read_tokens": 0,
+      "output_tokens": 0,
+      "expected_co2_grams": 3.9,
+      "expected_cost_usd": 0.4
+    },
+    {
+      "id": "haiku-cache-read-only",
+      "description": "Haiku, large cache_read only",
+      "model": "claude-3-5-haiku",
+      "input_tokens": 0,
+      "cache_creation_tokens": 0,
+      "cache_read_tokens": 10000000,
+      "output_tokens": 0,
+      "expected_co2_grams": 8.0,
+      "expected_cost_usd": 0.1
+    }
+  ],
+  "_reprice_2026_09_07": "Sonnet family repriced 3/15 -> 2/10 (Claude Sonnet 5 list price, permanent since 2026-06-30). Only expected_cost_usd moves on the Sonnet vectors; every expected_co2_grams is unchanged.",
+  "_reprice_2026_10_09": "Haiku family repriced 1/5 -> 0.1/0.5 (Claude Haiku 5.5, launched 2026-10-07, the model Claude Code's haiku alias resolves to; prompts up to 100,000 tokens). Only expected_cost_usd moves, on the three Haiku vectors (each divided by 10): haiku-mixed 0.2025 -> 0.02025, haiku-tiny-session 0.06 -> 0.006, haiku-cache-read-only 1.0 -> 0.1. Every expected_co2_grams is unchanged. haiku-mixed now needs 5 decimals, an exception to _rounding: a runner that rounds cost to 4 decimals reads 0.0203.",
+  "_reprice_2026_10_09_opus": "Opus family repriced 5/25 -> 4/20 (Claude Opus 5.5, launched 2026-09-22, the model Claude Code's opus alias resolves to; its 0.05x cache read is carried by the claude-opus-5-5 override, not by this family contract, which keeps the global 0.1x). Replayed without overrides, the six Opus vectors scale by exactly 0.8: opus-no-cache 7.5 -> 6.0, opus-cache-write-only 0.625 -> 0.5, opus-heavy-session 8.15 -> 6.52, opus-cache-write-1h-only 1.0 -> 0.8, opus-cache-write-split-ttl 1.8125 -> 1.45, opus-claude-code-session-1h 9.6 -> 7.68. Every expected_co2_grams is unchanged.",
+  "_refactor_2026_10_14_haiku": "Haiku family emission factors 20/413 -> 10/207 (0.5x -> 0.25x Sonnet, see METHODOLOGY.md). Only expected_co2_grams moves, on the Haiku vectors: haiku-mixed 10.06 -> 5.04, haiku-tiny-session 4.33 -> 2.17, haiku-cache-read-only 16.0 -> 8.0. Every expected_cost_usd is unchanged."
+}
