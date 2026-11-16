@@ -1,0 +1,68 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/persist-session.sh\""
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/persist-on-exit.sh\""
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": ".+",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/agent-stop.sh\""
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/safety-rescan.sh\""
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Bash(gh pr create *)",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/pr-hook.sh\""
+          },
+          {
+            "type": "command",
+            "if": "Bash(git push *)",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/pr-hook.sh\""
+          }
+        ]
+      }
+    ]
+  },
+  "modules": [
+    "./mod/register.tsx"
+  ]
+}

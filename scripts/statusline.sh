@@ -1,0 +1,459 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# statusline.sh — Reads Claude Code status JSON from stdin, outputs formatted CO2 status line.
+# Usage: echo '{"session_id":...}' | statusline.sh
+#        ... | statusline.sh --segment   (cost + CO2 only, for embedding in
+#        another status line, e.g. a ccstatusline custom command widget)
+
+# stdin is a terminal rather than Claude Code's JSON when Windows opens this file in a Git
+# Bash window: Claude Code ran the command in PowerShell (no Git Bash when the session
+# started), and PowerShell launched the .sh through its file association. Nothing will
+# arrive, so leave now instead of holding that window open.
+[ -t 0 ] && exit 0
+
+SEGMENT_MODE=0
+[ "${1:-}" = "--segment" ] && SEGMENT_MODE=1
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/portable-lib.sh
+. "${SCRIPT_DIR}/portable-lib.sh"
+FACTORS_FILE="${SCRIPT_DIR}/../data/factors.json"
+PRICES_FILE="${SCRIPT_DIR}/../data/prices.json"
+CONFIG_DIR="$(cc_path "${CLAUDE_CONFIG_DIR:-${HOME}/.claude}")"
+DB_PATH="$(cc_path "${CLAUDE_CARBON_DB:-${CONFIG_DIR}/claude-carbon/carbon.db}")"
+# The per-agent usage cache (see cc_session_usage), beside Claude Code's own data, never
+# beside a database CLAUDE_CARBON_DB may have put in a synced folder
+# shellcheck disable=SC2034 # read by cc_session_usage
+CC_USAGE_CACHE_DIR="${CONFIG_DIR}/claude-carbon/usage-cache"
+
+# Read stdin
+INPUT="$(cat)"
+
+# Extract fields with defaults to avoid failures on null
+MODEL_ID="$(echo "$INPUT" | jq -r '.model.id // ""')"
+DISPLAY_NAME="$(echo "$INPUT" | jq -r '.model.display_name // "Unknown model"' | sed -E 's/ *\((1M|200K) context\)//')"
+INPUT_TOKENS="$(echo "$INPUT" | jq -r '.context_window.total_input_tokens // 0')"
+OUTPUT_TOKENS="$(echo "$INPUT" | jq -r '.context_window.total_output_tokens // 0')"
+COST_USD="$(echo "$INPUT" | jq -r '.cost.total_cost_usd // 0')"
+USED_PCT="$(echo "$INPUT" | jq -r '.context_window.used_percentage // 0')"
+# Native path on Windows ("C:\\Users\\me\\code\\x"): basename and `git -C`
+# both need it converted first.
+CURRENT_DIR="$(cc_path "$(echo "$INPUT" | jq -r '.workspace.current_dir // ""')")"
+SESSION_ID="$(echo "$INPUT" | jq -r '.session_id // ""')"
+
+# Project name = last path segment
+PROJECT="$(basename "$CURRENT_DIR")"
+
+# Load emission factors for the model's family (shared resolution: cc_model_params in
+# portable-lib.sh). Zero for non-Anthropic models, e.g. local models behind
+# ANTHROPIC_BASE_URL: a datacenter factor doesn't apply to them.
+if ! cc_is_excluded_model "$MODEL_ID"; then
+  IFS=$'\t' read -r _ _ FACTOR_IN FACTOR_OUT _ <<< "$(printf '%s\n' "$MODEL_ID" | cc_model_params "$FACTORS_FILE" "$PRICES_FILE" 2>/dev/null)" || true
+  case "$FACTOR_IN" in ''|*[!0-9.]*) FACTOR_IN="39" ;; esac
+  case "$FACTOR_OUT" in ''|*[!0-9.]*) FACTOR_OUT="826" ;; esac
+else
+  FACTOR_IN="0"
+  FACTOR_OUT="0"
+fi
+
+# CO2 in grams. Preferred source: this session's row in carbon.db, written by the Stop
+# hook at the end of every turn. That figure is CUMULATIVE and carries the full token
+# breakdown (cache reads, subagents), so it sits on the same time base as the cost next
+# to it. It lags by at most one turn.
+#
+# No row yet: the first turn, whose Stop hook is still writing it as the status line
+# draws, and nothing redraws the status line after it. The transcript is short then, so
+# the status line makes the hook's own computation on it (cc_session_usage) and shows the
+# figure the database and the mod will show. Without it, the context-window estimate
+# counted cache reads at the full input factor: 6 g for an answer of 4.3 g. Only without a
+# row: a session whose row says 0 (excluded, or no usage yet) shows 0 rather than reading
+# its transcripts at every refresh. A first turn that starts a workflow can grow large
+# before its row exists, so the computation is kept for 10 seconds in a small file beside
+# the database (never in it) and reused while the main transcript keeps its size.
+#
+# Last fallback, the context-window estimate (no database, no transcript): a SNAPSHOT of
+# the current context, not a session total, and it drops back every time the context is
+# compacted. On a long agentic session it understates the real footprint by orders of
+# magnitude, which is exactly why the DB is preferred.
+CO2_G=""
+if [ -n "$SESSION_ID" ] && [ -f "$DB_PATH" ] && command -v sqlite3 >/dev/null 2>&1; then
+  SESSION_ID_SQL="${SESSION_ID//$CC_SQ/$CC_SQ$CC_SQ}"
+  # The row's CO2, 0 for an excluded session; nothing when there is no row
+  CO2_G="$(cc_sql -cmd ".timeout 300" "$DB_PATH" "SELECT CASE WHEN COALESCE(excluded, 0) = 1 THEN '0' ELSE printf('%.0f', COALESCE(co2_grams, 0)) END FROM sessions WHERE session_id='${SESSION_ID_SQL}';" 2>/dev/null || true)"
+  case "$CO2_G" in ''|*[!0-9]*) CO2_G="" ;; esac
+  TRANSCRIPT_PATH=""
+  if [ -z "$CO2_G" ] && [ "$FACTOR_IN" != "0" ]; then
+    TRANSCRIPT_PATH="$(cc_path "$(echo "$INPUT" | jq -r '.transcript_path // ""')")"
+  fi
+  if [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT_PATH" ]; then
+    # One line beside the database: the session, when, the main transcript's size, the CO2.
+    # Reused only for the same session and size, within 10 seconds: an answer that grows
+    # the transcript is computed again (a second-precision mtime would miss it).
+    SL_CACHE="$(dirname "$DB_PATH")/statusline-cache"
+    SL_NOW="$(date +%s 2>/dev/null || echo 0)"
+    SL_SIZE="$(wc -c < "$TRANSCRIPT_PATH" 2>/dev/null | tr -d ' \r' || true)"
+    SL_SID=""; SL_AT=""; SL_LEN=""; SL_CO2=""
+    if [ -f "$SL_CACHE" ]; then
+      IFS="$(printf '\t')" read -r SL_SID SL_AT SL_LEN SL_CO2 < "$SL_CACHE" 2>/dev/null || true
+    fi
+    SL_CO2="${SL_CO2%"$(printf '\r')"}"
+    case "${SL_AT}${SL_LEN}${SL_CO2}${SL_SIZE}" in ''|*[!0-9]*) SL_AT="" ;; esac
+    if [ -n "$SL_AT" ] && [ "$SL_SID" = "$SESSION_ID" ] && [ "$SL_LEN" = "$SL_SIZE" ] \
+      && [ $((SL_NOW - SL_AT)) -ge 0 ] && [ $((SL_NOW - SL_AT)) -lt 10 ]; then
+      CO2_G="$SL_CO2"
+    else
+      cc_collect_subagents "$(dirname "$TRANSCRIPT_PATH")/${SESSION_ID}/subagents"
+      SUB_FILES=(${CC_SUB_FILES[@]+"${CC_SUB_FILES[@]}"})
+      if USAGE="$(cc_session_usage "$FACTORS_FILE" "$PRICES_FILE" "$TRANSCRIPT_PATH" ${SUB_FILES[@]+"${SUB_FILES[@]}"})"; then
+        cc_parse_usage "$USAGE"
+        CO2_G="$(printf '%s\n' "$CC_U_CO2" | LC_ALL=C awk '{printf "%.0f", $1}')"
+        case "$CO2_G" in ''|*[!0-9]*) CO2_G="" ;; esac
+        if [ -n "$CO2_G" ]; then
+          { printf '%s\t%s\t%s\t%s\n' "$SESSION_ID" "$SL_NOW" "$SL_SIZE" "$CO2_G" > "${SL_CACHE}.tmp.$$" \
+              && mv -f "${SL_CACHE}.tmp.$$" "$SL_CACHE"; } 2>/dev/null || rm -f "${SL_CACHE}.tmp.$$" 2>/dev/null || true
+        fi
+      fi
+    fi
+  fi
+fi
+if [ -z "$CO2_G" ]; then
+  CO2_G="$(echo "$INPUT_TOKENS $FACTOR_IN $OUTPUT_TOKENS $FACTOR_OUT" | LC_ALL=C awk '{printf "%.0f", ($1 * $2 + $3 * $4) / 1000000}')"
+fi
+
+# Format CO2 with adaptive unit: whole grams, one-decimal kilograms from 1000 g.
+# A function because the monthly nudge prints its figure the same way.
+co2_display() {
+  if [ "$1" -ge 1000 ] 2>/dev/null; then
+    echo "$(echo "$1" | LC_ALL=C awk '{printf "%.1fkg", $1/1000}')CO₂"
+  else
+    echo "${1}gCO₂"
+  fi
+}
+CO2_DISPLAY="$(co2_display "$CO2_G")"
+
+# Round cost to 2 decimals
+COST_DISPLAY="$(echo "$COST_USD" | LC_ALL=C awk '{printf "%.2f", $1}')"
+
+# Segment mode stops here: no progress bar, no quota lookup (and so no
+# network fallback), no git call. The host status line owns the rest.
+if [ "$SEGMENT_MODE" = "1" ]; then
+  echo "\$${COST_DISPLAY} · ${CO2_DISPLAY}"
+  exit 0
+fi
+
+# Build progress bar (10 blocks)
+FILLED=$(( USED_PCT * 10 / 100 ))
+EMPTY=$(( 10 - FILLED ))
+PROGRESS_BAR=""
+for ((i=0; i<FILLED; i++)); do PROGRESS_BAR="${PROGRESS_BAR}▓"; done
+for ((i=0; i<EMPTY; i++)); do PROGRESS_BAR="${PROGRESS_BAR}░"; done
+
+# Color dot and percentage display
+if [ "$USED_PCT" -ge 80 ]; then
+  DOT="🔴"
+  PCT_DISPLAY="COMPACT!"
+elif [ "$USED_PCT" -ge 60 ]; then
+  DOT="🟡"
+  PCT_DISPLAY="${USED_PCT}%"
+else
+  DOT="🟢"
+  PCT_DISPLAY="${USED_PCT}%"
+fi
+
+# Subscription quota: the 5-hour window, or the weekly one when there is no 5-hour window
+# (a verified Ultra account has none since 2026-10-30, and Claude Code drops a window once
+# it has reset). Same data as `/usage` in Claude Code.
+USAGE_SEGMENT=""
+if command -v jq &>/dev/null; then
+  # Priority 1: the rate_limits Claude Code passes on stdin. When they are there, a window
+  # they leave out does not exist, and the API is never asked for it.
+  RL_PRESENT=0; FIVE_PCT=""; FIVE_RESET=""; SEVEN_PCT=""; SEVEN_RESET=""
+  IFS='|' read -r RL_PRESENT FIVE_PCT FIVE_RESET SEVEN_PCT SEVEN_RESET <<EOF
+$(echo "$INPUT" | jq -r '.rate_limits as $r
+  | [ (if ($r | type) == "object" then 1 else 0 end),
+      ($r.five_hour.used_percentage? // ""), ($r.five_hour.resets_at? // ""),
+      ($r.seven_day.used_percentage? // ""), ($r.seven_day.resets_at? // "") ]
+  | map(tostring) | join("|")' 2>/dev/null)
+EOF
+
+  # Priority 2: no rate_limits on stdin (before the session's first response, or an older
+  # Claude Code): GET /api/oauth/usage, asked at most once a minute, answered or not.
+  if [ "${RL_PRESENT:-0}" != "1" ]; then
+    USAGE_CACHE_DIR="${CONFIG_DIR}/claude-carbon"
+    USAGE_CACHE_FILE="${USAGE_CACHE_DIR}/oauth-usage.json"
+    # Touched at each call, so a refused one (the endpoint answers 429 at times) does not
+    # put a curl of up to 5 s on every render
+    USAGE_ATTEMPT_FILE="${USAGE_CACHE_DIR}/oauth-usage.attempt"
+    USAGE_CACHE_TTL=60
+    mkdir -p "$USAGE_CACHE_DIR"
+    # usage_age <file>: seconds since it was written, very large when unknown
+    usage_age() {
+      local m
+      m="$(cc_mtime "$1" 2>/dev/null || true)"
+      case "$m" in ''|*[!0-9]*) echo 999999999 ;; *) echo $(( $(date +%s) - m )) ;; esac
+    }
+
+    NEEDS_REFRESH=1
+    for f in "$USAGE_CACHE_FILE" "$USAGE_ATTEMPT_FILE"; do
+      [ -f "$f" ] && [ "$(usage_age "$f")" -lt "$USAGE_CACHE_TTL" ] && NEEDS_REFRESH=0
+    done
+
+    if [ "$NEEDS_REFRESH" = "1" ]; then
+      { : > "$USAGE_ATTEMPT_FILE"; } 2>/dev/null || true
+      TOKEN=""
+      if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+        TOKEN="$CLAUDE_CODE_OAUTH_TOKEN"
+      elif [ "$CC_OS" = "darwin" ] && command -v security &>/dev/null; then
+        BLOB="$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null || true)"
+        [ -n "$BLOB" ] && TOKEN="$(echo "$BLOB" | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null || true)"
+      fi
+      if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+        CREDS="${CONFIG_DIR}/.credentials.json"
+        [ -f "$CREDS" ] && TOKEN="$(jq -r '.claudeAiOauth.accessToken // empty' "$CREDS" 2>/dev/null || true)"
+      fi
+
+      if [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ]; then
+        RESPONSE="$(curl -s --max-time 5 \
+          -H "Accept: application/json" \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Bearer $TOKEN" \
+          -H "anthropic-beta: oauth-2025-04-20" \
+          -H "User-Agent: claude-code/2.1.34" \
+          "https://api.anthropic.com/api/oauth/usage" 2>/dev/null || true)"
+        if [ -n "$RESPONSE" ] && echo "$RESPONSE" \
+          | jq -e '(.five_hour | type) == "object" or (.seven_day | type) == "object"' >/dev/null 2>&1; then
+          echo "$RESPONSE" > "$USAGE_CACHE_FILE"
+        fi
+      fi
+    fi
+
+    # A window the API reports without a reset time has not started: it is left out. A
+    # cache older than 15 minutes is not read: every call since may have been refused, and
+    # a weekly window stays open for days on a stale figure.
+    if [ -f "$USAGE_CACHE_FILE" ] && [ "$(usage_age "$USAGE_CACHE_FILE")" -lt 900 ]; then
+      IFS='|' read -r FIVE_PCT FIVE_RESET SEVEN_PCT SEVEN_RESET <<EOF
+$(jq -r 'def w: if (.resets_at? // "") == "" then ["", ""] else [(.utilization // ""), .resets_at] end;
+  [ (.five_hour | w), (.seven_day | w) ] | flatten | map(tostring) | join("|")' "$USAGE_CACHE_FILE" 2>/dev/null)
+EOF
+    fi
+  fi
+
+  # quota_epoch <resets_at>: Unix seconds, from the epoch Claude Code passes or the ISO-8601
+  # the API returns (2026-04-21T08:00:00.608966+00:00, in UTC); empty when unreadable
+  quota_epoch() {
+    local v="${1%%.*}"
+    [ -n "$v" ] || return 0
+    case "$v" in
+      *[!0-9]*) ;;
+      *) echo "$v"; return 0 ;;
+    esac
+    v="${v%%Z}"; v="${v%%+*}"
+    date -j -u -f "%Y-%m-%dT%H:%M:%S" "$v" "+%s" 2>/dev/null || date -d "$1" "+%s" 2>/dev/null || true
+  }
+  NOW_EPOCH="$(date +%s)"
+  FIVE_END="$(quota_epoch "$FIVE_RESET")"
+  SEVEN_END="$(quota_epoch "$SEVEN_RESET")"
+  # A window whose reset has passed is over: Claude Code drops it, an old cache still has it
+  if [ -n "$FIVE_END" ] && [ "$FIVE_END" -le "$NOW_EPOCH" ]; then FIVE_PCT=""; fi
+  if [ -n "$SEVEN_END" ] && [ "$SEVEN_END" -le "$NOW_EPOCH" ]; then SEVEN_PCT=""; fi
+
+  # The window shown, its length and the 🔥 grace, in seconds
+  Q_PCT=""; Q_END=""; Q_LEN=0; Q_GRACE=0; Q_LABEL=""
+  if [ -n "$FIVE_PCT" ]; then
+    Q_PCT="$FIVE_PCT"; Q_END="$FIVE_END"; Q_LEN=18000; Q_GRACE=900
+  elif [ -n "$SEVEN_PCT" ]; then
+    Q_PCT="$SEVEN_PCT"; Q_END="$SEVEN_END"; Q_LEN=604800; Q_GRACE=86400; Q_LABEL=" 7d"
+  fi
+
+  if [ -n "$Q_PCT" ]; then
+    USAGE_PCT_INT="$(echo "$Q_PCT" | LC_ALL=C awk '{printf "%.0f", $1}')"
+    [ "$USAGE_PCT_INT" -gt 100 ] 2>/dev/null && USAGE_PCT_INT=100
+
+    # The reset in local time; a weekly one more than a day away as its weekday
+    RESET_LOCAL=""
+    if [ -n "$Q_END" ]; then
+      RESET_FMT="+%H:%M"
+      [ "$Q_LEN" -gt 18000 ] && [ $(( Q_END - NOW_EPOCH )) -ge 86400 ] && RESET_FMT="+%a"
+      RESET_LOCAL="$(LC_ALL=C date -r "$Q_END" "$RESET_FMT" 2>/dev/null \
+        || LC_ALL=C date -d "@$Q_END" "$RESET_FMT" 2>/dev/null || echo "")"
+    fi
+
+    # 🔥 when the burn rate since the window opened (its reset minus its length) would pass
+    # 100% of the limit by its end. From 15% used, after a grace: 15 min of a 5-hour window,
+    # a day of a weekly one, so a week is not judged on one working morning.
+    WARN=""
+    if [ -n "$Q_END" ] && [ "$USAGE_PCT_INT" -ge 15 ] 2>/dev/null; then
+      ELAPSED_SEC=$(( NOW_EPOCH - (Q_END - Q_LEN) ))
+      if [ "$ELAPSED_SEC" -gt "$Q_GRACE" ]; then
+        HOT="$(echo "$Q_PCT $ELAPSED_SEC $Q_LEN" | LC_ALL=C awk '{print (($1 * $3 / $2) >= 100) ? "1" : "0"}')"
+        [ "$HOT" = "1" ] && WARN="🔥 "
+      fi
+    fi
+
+    USAGE_SEGMENT=" | ${WARN}Use ${USAGE_PCT_INT}%${Q_LABEL}${RESET_LOCAL:+ ↻${RESET_LOCAL}}"
+  fi
+fi
+
+# Git branch (if in a git repo)
+BRANCH_SUFFIX=""
+if [ -n "$CURRENT_DIR" ] && command -v git &>/dev/null; then
+  BRANCH="$(git -C "$CURRENT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  [ -n "$BRANCH" ] && [ "$BRANCH" != "HEAD" ] && BRANCH_SUFFIX=" ⌥ ${BRANCH}"
+fi
+
+# "Update available" notice — read-only, network-free. The remote check runs in the background
+# (SessionStart hook → check-update.sh) and writes a cached flag; here we only read it. A 7-day
+# staleness gate means an abandoned flag (background check stopped) self-clears.
+UPDATE_SEGMENT=""
+UPD_FILE="${CONFIG_DIR}/claude-carbon/update-check.json"
+# The plugin's copy (its own status line, see cc_plugin_statusline) has its own flag. Nothing
+# clears it when `claude plugin update` lands, so it counts only for the version that ran the
+# check: the cache folder's name, no process spent on it.
+UPD_OWN=""
+if cc_is_plugin_cache "$SCRIPT_DIR"; then
+  UPD_FILE="${CONFIG_DIR}/claude-carbon/plugin-update-check.json"
+  UPD_OWN="${SCRIPT_DIR%/scripts}"; UPD_OWN="${UPD_OWN##*/}"
+fi
+if [ -z "${CLAUDE_CARBON_NO_UPDATE_NOTIFIER:-}" ] && [ -f "$UPD_FILE" ] && command -v jq &>/dev/null; then
+  # One jq call for the four fields: this runs on every turn, so each spawn is felt.
+  UPD_BEHIND=""; UPD_AT=0; UPD_REMOTE=""; UPD_LOCAL=""
+  IFS="$(printf '\t')" read -r UPD_BEHIND UPD_AT UPD_REMOTE UPD_LOCAL <<EOF
+$(jq -r '[(.behind // false), (.checked_at // 0), (.remote // ""), (.local // "")] | @tsv' "$UPD_FILE" 2>/dev/null)
+EOF
+  UPD_LOCAL="${UPD_LOCAL%$'\r'}"
+  [ -n "$UPD_OWN" ] && [ "$UPD_LOCAL" != "$UPD_OWN" ] && UPD_BEHIND=""
+  if [ "$UPD_BEHIND" = "true" ] && [ "${UPD_AT:-0}" -gt 0 ] 2>/dev/null && [ "$(( $(date +%s) - UPD_AT ))" -lt 604800 ] 2>/dev/null; then
+    # Naming the target version turns "something changed" into a judgeable call: a patch and a
+    # minor deserve different urgency. Falls back to the bare command if the flag predates it.
+    UPDATE_SEGMENT=" | ⬆ ${UPD_REMOTE:+${UPD_REMOTE} }/carbon-update"
+  fi
+fi
+
+# Install-sync check — local-only, two cmp calls, no state file. On machines with TWO installs
+# (a git clone hosting this statusline + a marketplace install running the hooks, the
+# plugin-author topology), a stale plugin cache silently writes carbon.db with outdated
+# factors while every check runs green on the current copy (incident of 2026-08-01: six weeks
+# of sessions persisted with pre-v6 factors). Auto-update is opt-in for third-party
+# marketplaces, so the cache CAN lag. Here we compare this install's factors/prices against
+# the newest cached copy of the plugin. Fast path: one cmp per file, no spawn when the bytes
+# match (the common case). Only when they differ do we spend a jq to compare the data with
+# the "_"-prefixed documentation keys stripped: a docs-only edit to a comment key (the
+# 2026-08-22 false positive, 17d396a) must not look like a factor change, while any value
+# difference still does. Self-skips when this statusline IS the newest cache copy
+# (single-install machines).
+DRIFT_SEGMENT=""
+# drift_values_differ <a> <b>: 0 when the two JSON files disagree once every "_"-prefixed
+# key (at any depth) is removed; 1 when they agree. Without jq, any byte difference counts.
+drift_values_differ() {
+  command -v jq &>/dev/null || return 0
+  local A B
+  A="$(jq -S 'walk(if type == "object" then with_entries(select(.key | startswith("_") | not)) else . end)' "$1" 2>/dev/null)" || return 0
+  B="$(jq -S 'walk(if type == "object" then with_entries(select(.key | startswith("_") | not)) else . end)' "$2" 2>/dev/null)" || return 0
+  [ "$A" != "$B" ]
+}
+if [ -z "${CLAUDE_CARBON_NO_DRIFT_CHECK:-}" ] && printf '1.0\n1.0.1\n' | sort -V >/dev/null 2>&1; then
+  CACHE_LATEST=""
+  for D in "${CONFIG_DIR}/plugins/cache"/*/claude-carbon/*/; do
+    [ -d "$D" ] || continue
+    if [ -z "$CACHE_LATEST" ] || [ "$(printf '%s\n%s\n' "$CACHE_LATEST" "$D" | sort -V | tail -1)" = "$D" ]; then
+      CACHE_LATEST="$D"
+    fi
+  done
+  if [ -n "$CACHE_LATEST" ]; then
+    OWN_ROOT="$(cd "${SCRIPT_DIR}/.." 2>/dev/null && pwd || echo "")"
+    CACHE_ROOT="$(cd "$CACHE_LATEST" 2>/dev/null && pwd || echo "")"
+    if [ -n "$OWN_ROOT" ] && [ -n "$CACHE_ROOT" ] && [ "$OWN_ROOT" != "$CACHE_ROOT" ]; then
+      for F in data/factors.json data/prices.json; do
+        if [ -f "${CACHE_ROOT}/${F}" ] && [ -f "${OWN_ROOT}/${F}" ] \
+           && ! cmp -s "${CACHE_ROOT}/${F}" "${OWN_ROOT}/${F}" \
+           && drift_values_differ "${CACHE_ROOT}/${F}" "${OWN_ROOT}/${F}"; then
+          DRIFT_SEGMENT=" | ≠ install drift"
+          break
+        fi
+      done
+    fi
+  fi
+fi
+
+# Monthly share nudge: "📊 September: 84.2kgCO₂ · /carbon-card", from the 1st
+# through the Nth of each month (N = CLAUDE_CARBON_CARD_NUDGE_UNTIL_DAY, default
+# 10). The figure is the month just closed, the bar the card draws for it, in the
+# same format as the session figure next to it. Generating a card clears the nudge
+# for the month (generate-report.sh stamps last-card-month); otherwise it goes
+# quiet by itself after the Nth. Passive and short: a user who ignores it is not
+# asked again before next month. Local-only; opt-out via CLAUDE_CARBON_NO_CARD_NUDGE.
+#
+# The total is read once a day and cached in last-month-total ("YYYY-MM-DD/<period>
+# grams", the key being the day it was read and what it sums: a month, or a year in
+# December and early January), never on every refresh. Daily rather than
+# monthly: the Stop hook keeps adding to a session under its start date, so a
+# session begun before midnight on the last day still grows the closed month after
+# the 1st, and the card would show more than a figure frozen on the 1st. A month
+# with fewer than 7 days of sessions caches "-" and shows nothing: on a fresh
+# install the nudge would otherwise advertise a near-empty card.
+#
+# In December the figure is the year so far and the nudge stays the whole month: the
+# card covers the calendar year, and that is the month to look back on it. In January,
+# over the usual first days, it is the year just ended, which the card then covers by
+# default (generate-report.sh).
+#
+# It used to show to the first three sessions of the month and then stop, which
+# on a status line amounted to two or three glances at "📊 /carbon-card" with no
+# hint of what the card would show. Nobody acted on it. "📊 August wrapped" named
+# the month but still not what the card would say.
+CARD_SEGMENT=""
+if [ -z "${CLAUDE_CARBON_NO_CARD_NUDGE:-}" ]; then
+  THIS_MONTH="$(date +%Y-%m)"
+  TODAY_DAY="$((10#$(date +%d)))"
+  NUDGE_UNTIL="${CLAUDE_CARBON_CARD_NUDGE_UNTIL_DAY:-10}"
+  CARD_STAMP="$(cat "${CONFIG_DIR}/claude-carbon/last-card-month" 2>/dev/null || true)"
+  # December: open the whole month, unless the last day is 0 (the opt-out by number)
+  NUDGE_LAST="$NUDGE_UNTIL"
+  if [ "${THIS_MONTH#*-}" = "12" ] && [ "$NUDGE_UNTIL" -gt 0 ] 2>/dev/null; then NUDGE_LAST=31; fi
+  if [ "$CARD_STAMP" != "$THIS_MONTH" ] && [ "$TODAY_DAY" -le "$NUDGE_LAST" ] 2>/dev/null; then
+    PREV_Y="${THIS_MONTH%-*}"
+    PREV_M="$((10#${THIS_MONTH#*-} - 1))"
+    if [ "$PREV_M" -eq 0 ]; then PREV_M=12; PREV_Y="$((PREV_Y - 1))"; fi
+    PREV_MONTH="$(printf '%04d-%02d' "$PREV_Y" "$PREV_M")"
+    # What is summed and how it is named: the closed month, or in December the year
+    NUDGE_PERIOD="$PREV_MONTH"
+    NUDGE_NAME="$(cc_prev_month_name "$THIS_MONTH")"
+    if [ "${THIS_MONTH#*-}" = "12" ]; then
+      NUDGE_PERIOD="${THIS_MONTH%-*}"
+      NUDGE_NAME="${THIS_MONTH%-*}"
+    elif [ "${THIS_MONTH#*-}" = "01" ]; then
+      NUDGE_PERIOD="$PREV_Y"
+      NUDGE_NAME="$PREV_Y"
+    fi
+    TOTAL_FILE="${CONFIG_DIR}/claude-carbon/last-month-total"
+    # The day and what is summed: a figure cached for a month is never shown as a year's
+    printf -v TOTAL_KEY '%s-%02d/%s' "$THIS_MONTH" "$TODAY_DAY" "$NUDGE_PERIOD"
+    PREV_KEY=""; PREV_TOTAL=""
+    { read -r PREV_KEY PREV_TOTAL < "$TOTAL_FILE"; } 2>/dev/null || true
+    if [ "$PREV_KEY" != "$TOTAL_KEY" ]; then
+      PREV_TOTAL=""
+      if [ -f "$DB_PATH" ] && command -v sqlite3 >/dev/null 2>&1; then
+        # The card's monthly bar: same grouping on started_at, excluded rows left out.
+        MONTH_ROW="$(sqlite3 -cmd ".timeout 300" -separator ' ' "$DB_PATH" "SELECT COUNT(DISTINCT substr(started_at, 1, 10)), printf('%.0f', COALESCE(SUM(co2_grams), 0)) FROM sessions WHERE COALESCE(excluded, 0) = 0 AND substr(started_at, 1, ${#NUDGE_PERIOD}) = '${NUDGE_PERIOD}';" 2>/dev/null || true)"
+        MONTH_DAYS=""; MONTH_G=""
+        read -r MONTH_DAYS MONTH_G <<< "$MONTH_ROW" || true
+        # Cached only when the query answered: a locked or unreadable DB is retried.
+        case "${MONTH_DAYS}${MONTH_G}" in
+          ''|*[!0-9]*) ;;
+          *)
+            if [ "$MONTH_DAYS" -ge 7 ]; then PREV_TOTAL="$MONTH_G"; else PREV_TOTAL="-"; fi
+            mkdir -p "${CONFIG_DIR}/claude-carbon" 2>/dev/null || true
+            printf '%s %s\n' "$TOTAL_KEY" "$PREV_TOTAL" > "$TOTAL_FILE" 2>/dev/null || true
+            ;;
+        esac
+      fi
+    fi
+    case "$PREV_TOTAL" in
+      ''|*[!0-9]*) ;;
+      *) CARD_SEGMENT=" | 📊 ${NUDGE_NAME}: $(co2_display "$PREV_TOTAL") · /carbon-card" ;;
+    esac
+  fi
+fi
+
+echo "${PROJECT}${BRANCH_SUFFIX} | ${DOT} ${DISPLAY_NAME} ${PROGRESS_BAR} ${PCT_DISPLAY} | \$${COST_DISPLAY} · ${CO2_DISPLAY}${USAGE_SEGMENT}${UPDATE_SEGMENT}${DRIFT_SEGMENT}${CARD_SEGMENT}"
